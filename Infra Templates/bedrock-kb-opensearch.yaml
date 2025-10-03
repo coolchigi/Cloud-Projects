@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Amazon Bedrock Knowledge Base with OpenSearch Serverless - Chat with PDF
+
+Parameters:
+  DataSourceBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket containing your PDF documents
+    AllowedPattern: ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  KnowledgeBaseName:
+    Type: String
+    Default: kb-opensearch-chat-pdf
+    Description: Name for the Knowledge Base
+    MinLength: 1
+    MaxLength: 100
+
+  CollectionName:
+    Type: String
+    Default: bedrock-kb-collection
+    Description: Name for OpenSearch Serverless collection
+    AllowedPattern: ^[a-z][a-z0-9-]{2,31}$
+    ConstraintDescription: Must be 3-32 lowercase letters, numbers, or hyphens
+
+  VectorIndexName:
+    Type: String
+    Default: bedrock-vector-index
+    Description: Name for the vector index (create this manually after deployment)
+    MinLength: 1
+    MaxLength: 100
+
+  EmbeddingModel:
+    Type: String
+    Default: amazon.titan-embed-text-v1
+    Description: Embedding model to use (default is Titan Embed Text V1)
+    AllowedValues:
+      - amazon.titan-embed-text-v1 # 1536 dimensions
+      - amazon.titan-embed-text-v2:0 # 1024, 512, or 256 dimensions
+      - cohere.embed-english-v3 # 1024 dimensions
+      - cohere.embed-multilingual-v3 # 1024 dimensions
+
+  ChunkMaxTokens:
+    Type: Number
+    Default: 512
+    Description: Maximum tokens per chunk (fixed-size chunking)
+    MinValue: 20
+    MaxValue: 8192
+
+  ChunkOverlapPercentage:
+    Type: Number
+    Default: 20
+    Description: Overlap percentage between chunks (0-99)
+    MinValue: 0
+    MaxValue: 99
+
+Resources:
+  # Encryption Policy for OpenSearch Serverless
+  EncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub ${CollectionName}-encryption-policy
+      Type: encryption
+      Description: Encryption policy for Bedrock Knowledge Base collection
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${CollectionName}"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # Network Policy for OpenSearch Serverless (Public Access)
+  NetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub ${CollectionName}-network-policy
+      Type: network
+      Description: Network policy for Bedrock Knowledge Base collection
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${CollectionName}"]
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${CollectionName}"]
+              }
+            ],
+            "AllowFromPublic": true,
+            "SourceServices": ["bedrock.amazonaws.com"]
+          }
+        ]
+
+  # OpenSearch Serverless Collection
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - EncryptionPolicy
+      - NetworkPolicy
+    Properties:
+      Name: !Ref CollectionName
+      Type: VECTORSEARCH
+      Description: Vector search collection for Bedrock Knowledge Base
+      StandbyReplicas: DISABLED
+
+  # IAM Role for Bedrock Knowledge Base
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub BedrockKBRole-OpenSearch-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: S3DataSourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${DataSourceBucketName}
+                  - !Sub arn:aws:s3:::${DataSourceBucketName}/*
+        - PolicyName: OpenSearchServerlessAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !GetAtt OpenSearchCollection.Arn
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModel}
+
+  # Data Access Policy for OpenSearch Serverless
+  DataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    DependsOn: OpenSearchCollection
+    Properties:
+      Name: !Sub ${CollectionName}-data-access-policy
+      Type: data
+      Description: Data access policy for Bedrock Knowledge Base
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${CollectionName}/*"],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:DeleteIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument"
+                ]
+              },
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${CollectionName}"],
+                "Permission": [
+                  "aoss:CreateCollectionItems",
+                  "aoss:DeleteCollectionItems",
+                  "aoss:UpdateCollectionItems",
+                  "aoss:DescribeCollectionItems"
+                ]
+              }
+            ],
+            "Principal": [
+              "${BedrockKnowledgeBaseRole.Arn}",
+              "arn:aws:iam::${AWS::AccountId}:root"
+            ]
+          }
+        ]
+
+  # Knowledge Base with OpenSearch Serverless
+  KnowledgeBaseOpenSearch:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn:
+      - OpenSearchCollection
+      - DataAccessPolicy
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      Description: Knowledge Base using OpenSearch Serverless for vector storage
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModel}
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OpenSearchCollection.Arn
+          VectorIndexName: !Ref VectorIndexName
+          FieldMapping:
+            VectorField: bedrock-knowledge-base-default-vector
+            TextField: AMAZON_BEDROCK_TEXT_CHUNK
+            MetadataField: AMAZON_BEDROCK_METADATA
+
+  # Data Source connecting to S3 bucket
+  KnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub ${KnowledgeBaseName}-datasource
+      Description: S3 data source containing PDF documents
+      KnowledgeBaseId: !Ref KnowledgeBaseOpenSearch
+      DataDeletionPolicy: RETAIN
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !Sub arn:aws:s3:::${DataSourceBucketName}
+          BucketOwnerAccountId: !Ref AWS::AccountId
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: !Ref ChunkMaxTokens
+            OverlapPercentage: !Ref ChunkOverlapPercentage
+        ParsingConfiguration:
+          ParsingStrategy: BEDROCK_DEFAULT
+
+Outputs:
+  KnowledgeBaseId:
+    Description: ID of the created Knowledge Base
+    Value: !Ref KnowledgeBaseOpenSearch
+    Export:
+      Name: !Sub ${AWS::StackName}-KnowledgeBaseId
+
+  KnowledgeBaseArn:
+    Description: ARN of the created Knowledge Base
+    Value: !GetAtt KnowledgeBaseOpenSearch.KnowledgeBaseArn
+    Export:
+      Name: !Sub ${AWS::StackName}-KnowledgeBaseArn
+
+  DataSourceId:
+    Description: ID of the data source
+    Value: !Ref KnowledgeBaseDataSource
+    Export:
+      Name: !Sub ${AWS::StackName}-DataSourceId
+
+  OpenSearchCollectionArn:
+    Description: ARN of the OpenSearch Serverless collection
+    Value: !GetAtt OpenSearchCollection.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CollectionArn
+
+  OpenSearchCollectionEndpoint:
+    Description: Endpoint of the OpenSearch Serverless collection
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+
+  OpenSearchDashboardURL:
+    Description: URL for OpenSearch Dashboards
+    Value: !GetAtt OpenSearchCollection.DashboardEndpoint
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by the Knowledge Base
+    Value: !GetAtt BedrockKnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-RoleArn
+
+  DataSourceBucket:
+    Description: S3 bucket containing the source documents
+    Value: !Ref DataSourceBucketName
+
+  EmbeddingModelUsed:
+    Description: Embedding model used for this Knowledge Base
+    Value: !Ref EmbeddingModel
+
+  ChunkingStrategy:
+    Description: Chunking configuration used
+    Value: !Sub Fixed-size chunking with ${ChunkMaxTokens} max tokens and
+      ${ChunkOverlapPercentage}% overlap
+
+  VectorIndexNameUsed:
+    Description: Vector index name configured (must be created manually)
+    Value: !Ref VectorIndexName
+
+  PostDeploymentSteps:
+    Description: IMPORTANT - Manual steps required after deployment
+    Value: !Sub |
+      1. Go to OpenSearch Serverless Console: https://console.aws.amazon.com/aos/home?region=${AWS::Region}#opensearch/collections
+      2. Click on collection: ${CollectionName}
+      3. Go to 'Indexes' tab and click 'Create vector index'
+      4. Use these exact settings:
+         - Index name: ${VectorIndexName}
+         - Vector field name: bedrock-knowledge-base-default-vector
+         - Dimensions: 1536 (for Titan V1) or check your model
+         - Engine: FAISS
+         - Distance metric: Euclidean
+      5. After index creation, sync your Knowledge Base from Bedrock console
+
+  TestKnowledgeBaseURL:
+    Description: URL to test the Knowledge Base in AWS Console
+    Value: !Sub https://console.aws.amazon.com/bedrock/home?region=${AWS::Region}#/knowledge-bases/${KnowledgeBaseOpenSearch}
