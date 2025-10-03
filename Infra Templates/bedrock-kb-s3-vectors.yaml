@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Amazon Bedrock Knowledge Base with S3 Vectors - Chat with PDF
+
+Parameters:
+  DataSourceBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket containing your PDF documents
+    AllowedPattern: ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  KnowledgeBaseName:
+    Type: String
+    Default: kb-s3-vectors-chat-pdf
+    Description: Name for the Knowledge Base
+    MinLength: 1
+    MaxLength: 100
+
+  EmbeddingModel:
+    Type: String
+    Default: amazon.titan-embed-text-v1
+    Description: Embedding model to use (default is Titan Embed Text V1)
+    AllowedValues:
+      - amazon.titan-embed-text-v1 # 1536 dimensions
+      - amazon.titan-embed-text-v2:0 # 1024, 512, or 256 dimensions
+      - cohere.embed-english-v3 # 1024 dimensions
+      - cohere.embed-multilingual-v3 # 1024 dimensions
+
+  ChunkMaxTokens:
+    Type: Number
+    Default: 512
+    Description: Maximum tokens per chunk (fixed-size chunking)
+    MinValue: 20
+    MaxValue: 8192
+
+  ChunkOverlapPercentage:
+    Type: Number
+    Default: 20
+    Description: Overlap percentage between chunks (0-99)
+    MinValue: 0
+    MaxValue: 99
+
+Resources:
+  # IAM Role for Bedrock Knowledge Base
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub BedrockKBRole-S3Vectors-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: S3DataSourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${DataSourceBucketName}
+                  - !Sub arn:aws:s3:::${DataSourceBucketName}/*
+        - PolicyName: S3VectorsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:ListVectorIndexes
+                  - s3vectors:DescribeVectorIndex
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3express:CreateSession
+                Resource: '*'
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModel}
+
+  # Knowledge Base with S3 Vectors
+  KnowledgeBaseS3Vectors:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      Description: Knowledge Base using S3 Vectors for cost-effective vector storage
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModel}
+      StorageConfiguration:
+        Type: S3
+        # Note: S3 Vectors is in preview. The Quick Create option will automatically
+        # create an S3 vector bucket and vector index with appropriate settings.
+        # When using CloudFormation, you specify minimal configuration and AWS handles
+        # the vector bucket creation automatically.
+
+        # Data Source connecting to S3 bucket
+  KnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub ${KnowledgeBaseName}-datasource
+      Description: S3 data source containing PDF documents
+      KnowledgeBaseId: !Ref KnowledgeBaseS3Vectors
+      DataDeletionPolicy: RETAIN
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !Sub arn:aws:s3:::${DataSourceBucketName}
+          BucketOwnerAccountId: !Ref AWS::AccountId
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: !Ref ChunkMaxTokens
+            OverlapPercentage: !Ref ChunkOverlapPercentage
+        ParsingConfiguration:
+          ParsingStrategy: BEDROCK_DEFAULT
+
+Outputs:
+  KnowledgeBaseId:
+    Description: ID of the created Knowledge Base
+    Value: !Ref KnowledgeBaseS3Vectors
+    Export:
+      Name: !Sub ${AWS::StackName}-KnowledgeBaseId
+
+  KnowledgeBaseArn:
+    Description: ARN of the created Knowledge Base
+    Value: !GetAtt KnowledgeBaseS3Vectors.KnowledgeBaseArn
+    Export:
+      Name: !Sub ${AWS::StackName}-KnowledgeBaseArn
+
+  DataSourceId:
+    Description: ID of the data source
+    Value: !Ref KnowledgeBaseDataSource
+    Export:
+      Name: !Sub ${AWS::StackName}-DataSourceId
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by the Knowledge Base
+    Value: !GetAtt BedrockKnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-RoleArn
+
+  DataSourceBucket:
+    Description: S3 bucket containing the source documents
+    Value: !Ref DataSourceBucketName
+
+  EmbeddingModelUsed:
+    Description: Embedding model used for this Knowledge Base
+    Value: !Ref EmbeddingModel
+
+  ChunkingStrategy:
+    Description: Chunking configuration used
+    Value: !Sub Fixed-size chunking with ${ChunkMaxTokens} max tokens and
+      ${ChunkOverlapPercentage}% overlap
+
+  TestKnowledgeBaseURL:
+    Description: URL to test the Knowledge Base in AWS Console
+    Value: !Sub https://console.aws.amazon.com/bedrock/home?region=${AWS::Region}#/knowledge-bases/${KnowledgeBaseS3Vectors}
